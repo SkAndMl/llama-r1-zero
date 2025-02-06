@@ -1,7 +1,7 @@
 # reference:https://github.com/huggingface/trl/blob/949db2357e62d2f0a34decfc5e87eeeea0c6d72c/trl/trainer/grpo_trainer.py#L274-L281 
 
 import torch
-from typing import List, Optional, Union, Dict, Callable
+from typing import List, Optional, Union, Callable
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 class GRPOLoss:
