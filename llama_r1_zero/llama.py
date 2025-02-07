@@ -43,7 +43,7 @@ class Llama:
 
         return Llama(model, tokenizer, args)
 
-
+    @torch.inference_mode()
     def generate(self,
                  prompt_tokens: List[List[int]], 
                  temperature: float=0.6,
@@ -60,10 +60,10 @@ class Llama:
         pad_id = self.tokenizer.pad_id
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
         bsz = len(prompt_tokens)
-        input_tokens = torch.full((bsz, total_len), fill_value=pad_id, device=self.args.device)
+        input_tokens = torch.full((bsz, total_len), fill_value=pad_id, device=self.args.device, dtype=torch.long)
 
         for i, prompt_token in enumerate(prompt_tokens):
-            input_tokens[i, :len(prompt_token)] = torch.tensor(prompt_token)
+            input_tokens[i, :len(prompt_token)] = torch.tensor(prompt_token, dtype=torch.long, device=self.args.device)
         input_tokens = torch.repeat_interleave(input_tokens, repeats=num_generations, dim=0)
         bsz *= num_generations
 
@@ -79,7 +79,7 @@ class Llama:
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
-            next_token = next_token.reshape(-1,)
+            next_token = next_token.reshape(-1)
 
             input_tokens[:, cur_pos] = torch.where(
                 input_tokens_mask[:, cur_pos], input_tokens[:, cur_pos], next_token
@@ -92,7 +92,7 @@ class Llama:
     
         outs = []
         for i, completion in enumerate(input_tokens.tolist()):
-            toks = completion[len(prompt_tokens[i//num_generations]):]
+            toks = completion[len(prompt_tokens[i//num_generations]):len(prompt_tokens[i//num_generations])+max_gen_len]
             for stop_token in self.tokenizer.stop_tokens:
                 if stop_token in toks:
                     idx = toks.index(stop_token)

@@ -25,22 +25,25 @@ class ModelArgs:
 
 def precompute_freq_cis(seq_len: int=512, theta: int=10000, dim: int=384):
 
-    thetas = 1/(theta**(torch.arange(0, dim, 2)[:dim//2].float()/dim))
-    pos = torch.arange(seq_len)
-    pos_thetas = torch.outer(pos, thetas)
-    freq_cis = torch.polar(torch.ones_like(pos_thetas), pos_thetas)
+    freqs = 1/(theta**(torch.arange(0, dim, 2)[:dim//2].float()/dim))
+    t = torch.arange(seq_len, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freq_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freq_cis
+
+def reshape_for_broadcast(freq_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    shape = [d if i==1 or i==ndim-1 else 1 for i, d in enumerate(x.shape)]
+    return freq_cis.view(*shape)
 
 
 def apply_rotary_emb(x: torch.Tensor, freq_cis: torch.Tensor):
     # b, s, h, head_dim -> b, s, h, head_dim/2, 2 -> b, s, h, head_dim/2
-    x_c = torch.view_as_complex(x.reshape([*x.shape[:-1], -1, 2]))
-    freq_cis_ = freq_cis.unsqueeze(0).unsqueeze(2)
-    x_c = x_c*freq_cis_
-    x_real = torch.view_as_real(x_c)
+    x_c = torch.view_as_complex(x.float().reshape([*x.shape[:-1], -1, 2]))
+    freq_cis = reshape_for_broadcast(freq_cis, x_c)
+    x_c_out = torch.view_as_real(x_c*freq_cis).flatten(3)
     # b, s, h, head_dim/2, 2
-    x_rotated = x_real.reshape(*x.shape)
-    return x_rotated
+    return x_c_out.type_as(x)
 
 
 class RMSNorm(nn.Module):
@@ -79,13 +82,17 @@ class Attention(nn.Module):
                 freq_cis: torch.Tensor,
                 start_pos: int,
                 mask: Optional[torch.Tensor]=None):
-        bs, seq_len, dim = x.shape
+        bs, seq_len, _ = x.shape
         q, k, v = self.wq(x), self.wk(x), self.wv(x)
-        q = q.view((bs, seq_len, self.n_heads, self.head_dim))
-        k = k.view((bs, seq_len, self.n_kv_heads, self.head_dim))
-        v = v.view((bs, seq_len, self.n_kv_heads, self.head_dim)) 
+        q = q.view(bs, seq_len, self.n_heads, self.head_dim)
+        k = k.view(bs, seq_len, self.n_kv_heads, self.head_dim)
+        v = v.view(bs, seq_len, self.n_kv_heads, self.head_dim)
+        q = apply_rotary_emb(q, freq_cis)
         k = apply_rotary_emb(k, freq_cis)
-        v = apply_rotary_emb(v, freq_cis)
+        
+        self.cache_k = self.cache_k.to(q)
+        self.cache_v = self.cache_v.to(v)
+
         self.cache_k[:bs, start_pos:start_pos+seq_len] = k
         self.cache_v[:bs, start_pos:start_pos+seq_len] = v
 
@@ -97,11 +104,11 @@ class Attention(nn.Module):
         q = q.transpose(1, 2)
         new_k = new_k.transpose(1, 2)
         new_v = new_v.transpose(1, 2)
-        attn = q @ new_k.transpose(-1, -2)
+        attn = q @ new_k.transpose(-1, -2) / math.sqrt(self.head_dim)
         if mask is not None: attn += mask
-        attn = F.softmax(attn/math.sqrt(self.head_dim), dim=-1)
+        attn = F.softmax(attn.float(), dim=-1).type_as(q)
         out = attn @ new_v
-        out = out.transpose(1, 2).contiguous().view((bs, seq_len, -1))
+        out = out.transpose(1, 2).contiguous().view(bs, seq_len, -1)
         return self.wo(out)
 
 
@@ -119,7 +126,7 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
     
     def forward(self, x: torch.Tensor):
-        return self.w2(F.silu(self.w1(x))*self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerBlock(nn.Module):
@@ -161,15 +168,15 @@ class Transformer(nn.Module):
         
         mask = None
         if seq_len>1:
-            mask = torch.full(size=(seq_len, seq_len), fill_value=float("-inf"))
+            mask = torch.full(size=(seq_len, seq_len), fill_value=float("-inf"), device=x.device)
             mask = torch.triu(mask, diagonal=1)
             mask = torch.hstack([
-                torch.full((seq_len, start_pos), fill_value=0), mask
+                torch.zeros((seq_len, start_pos), device=x.device), mask
             ]).type_as(h)
         
         for layer in self.layers:
             h = layer(h, freq_cis, start_pos, mask)
         
         h = self.norm(h)
-        output = self.output(h)
+        output = self.output(h).float()
         return output
