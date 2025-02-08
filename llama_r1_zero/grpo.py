@@ -2,31 +2,32 @@
 
 import torch
 from typing import List, Optional, Union, Callable
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from .llama import Llama
+from .tokenizer import Tokenizer
 
 class GRPOLoss:
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
+        system_prompt: str,
         reward_funcs: List[Callable],
-        ref_model: Optional[PreTrainedModel] = None,
+        ref_model: Optional[Llama] = None,
         beta: float = 0.01,
-        max_prompt_length: Optional[int] = None,
         num_generations: int = 4,
-        max_new_tokens: int = None
+        max_new_tokens: int = None,
     ):
         self.tokenizer = tokenizer
+        self.system_prompt = system_prompt
         self.reward_funcs = reward_funcs
         self.ref_model = ref_model
         self.beta = beta
-        self.max_prompt_length = max_prompt_length
         self.num_generations = num_generations
-        self.max_new_tokens = max_new_tokens if max_new_tokens is not None else 256
+        self.max_new_tokens = max_new_tokens if max_new_tokens is not None else 1024
         self.metrics = {"reward": [], "reward_std": [], "kl": []}
 
-    def get_per_token_logprobs(self, model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
-
-        logits = model(input_ids).logits  # (bs, seq_len, vocab_size)
+    def get_per_token_logprobs(self, model: Llama, input_ids: torch.Tensor) -> torch.Tensor:
+        input_ids = input_ids.clone()
+        logits = model.model.forward(input_ids, start_pos=0)  # (bs, seq_len, vocab_size)
         logits = logits[:, :-1, :]  # exclude last prediction
         input_ids = input_ids[:, 1:]  # exclude first input ID
         
@@ -38,85 +39,77 @@ class GRPOLoss:
         
         return torch.stack(per_token_logprobs)
 
-    def compute_rewards(self, completions: List[List[str]]) -> torch.Tensor:
+    def compute_rewards(self, completions: List[List[str]], ground_truths: List[str]) -> torch.Tensor:
         # completions -> bs, g
+        # ground_truths -> bs
         bs = len(completions)
-        rewards = torch.zeros((bs, self.num_generations))
-        for i, group in enumerate(completions):
+        print(f'num of completions: {len(completions)}')
+        for completion in completions:
+            print(completion)
+        rewards = torch.zeros((bs//self.num_generations, self.num_generations))
+        for i in range(0, len(completions), self.num_generations):
             for reward_func in self.reward_funcs:
-                _rewards = reward_func(completions=group)
+                _rewards = reward_func(
+                    completions=completions[i:i+self.num_generations],
+                    ground_truths=[ground_truths[i//self.num_generations]]*self.num_generations
+                )
                 rewards[i, :] += torch.tensor(_rewards).float()
 
         return rewards.view(-1,) # bs*g
 
-    def compute_loss(self, model: PreTrainedModel, prompts: List[str]) -> Union[torch.Tensor, tuple]:
-            
-        prompt_inputs = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            add_special_tokens=False
-        ).to(model.device)
-
-        if self.max_prompt_length is not None:
-            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length:]
-            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length:]
-
+    def compute_loss(self, model: Llama, prompts: List[str], ground_truths: List[str]) -> Union[torch.Tensor, tuple]:
+        
+        prompt_inputs = [
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": p}
+            ]
+            for p in prompts
+        ]
+        prompts_tokens = [self.tokenizer.encode_dialog_prompt(p) for p in prompt_inputs]
+        max_prompt_len = max(len(p) for p in prompts_tokens)
+    
         with torch.inference_mode():
-            generated_ids = model.generate(
-                **prompt_inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample = True,
-                top_p = 0.9,
-                temperature = 0.6,
-                num_return_sequences=self.num_generations,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+            generated_ids: torch.Tensor = model.generate(
+                prompt_tokens=prompts_tokens,
+                temperature=0.6,
+                top_p=0.8,
+                num_generations=self.num_generations,
+                max_gen_len=self.max_new_tokens,
+                return_tensors=True
             )
+            
 
-        prompt_length = prompt_inputs["input_ids"].size(1)
-        completion_ids = generated_ids[:, prompt_length:]
+        completion_ids = generated_ids[:, max_prompt_len:]
 
-        # Get log probs for completions
         per_token_logps = self.get_per_token_logprobs(model, generated_ids)
-        per_token_logps = per_token_logps[:, prompt_length-1:]
+        per_token_logps = per_token_logps[:, max_prompt_len-1:]
 
-        # Get reference model log probs
         with torch.inference_mode():
             if self.ref_model is not None:
                 ref_per_token_logps = self.get_per_token_logprobs(self.ref_model, generated_ids)
             else:
                 ref_per_token_logps = self.get_per_token_logprobs(model, generated_ids)
-            ref_per_token_logps = ref_per_token_logps[:, prompt_length-1:]
+            ref_per_token_logps = ref_per_token_logps[:, max_prompt_len-1:]
 
-        # Create completion mask
-        is_eos = completion_ids == self.tokenizer.eos_token_id
-        device = model.device
+        is_eos = completion_ids == self.tokenizer.eos_id
+        device = model.args.device
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Decode completions for reward computation
-        completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        completions = self.tokenizer.decode_batch(completion_ids.tolist())
         
-        rewards = self.compute_rewards(completions)
-
-        # Compute grouped rewards statistics
+        rewards = self.compute_rewards(completions, ground_truths)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        
-        # Normalize rewards to compute advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        # Compute KL divergence
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - \
                       (ref_per_token_logps - per_token_logps) - 1
-
-        # Compute final loss
         advantages = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(advantages - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()

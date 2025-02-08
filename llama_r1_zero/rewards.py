@@ -17,13 +17,13 @@ def accuracy_reward(completions, ground_truths, **kwargs) -> List[float]:
     """
     reward of 1 if the answer matches the ground truth
     """
-    pattern = r'\\boxed\{(.*?)\}'
+    pattern = r'<answer>(.*?)</answer>'
     matches = [re.search(pattern, completion) for completion in completions]
     contents = [match.group(1) if match else "" for match in matches]
     return [1.0 if c==gt else 0.0 for (c, gt) in zip(contents, ground_truths)]
 
 
-def complexity_reward(completions, **kwargs) -> List[float]:
+def complexity_reward(completions, ground_truths, **kwargs) -> List[float]:
     """
     Reward is proportional to the length of the reasoning tokens inside <think>...</think>.
     """

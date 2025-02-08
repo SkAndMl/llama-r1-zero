@@ -2,6 +2,7 @@ from typing import Dict, List, cast, Sequence, Literal, TypedDict
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 from pathlib import Path
+import torch
 
 Role = Literal['system', 'user', 'assistant']
 
@@ -60,7 +61,6 @@ class Tokenizer:
     def encode(
         self,
         s: str,
-        *,
         bos: bool,
         eos: bool,
         allowed_special=set(),
@@ -76,33 +76,57 @@ class Tokenizer:
             t.append(self.eos_id)
         return t
 
+    def encode_batch(
+            self,
+            seqs: List[str], 
+            bos: bool, 
+            eos: bool,
+            padding_side: str ='right', 
+            allowed_special=set(), 
+            disallowed_special=()
+    ) -> torch.Tensor:
+        
+        max_len = 0
+        tokens = []
+        for s in seqs: 
+            _toks = self.encode(s, bos, eos, allowed_special, disallowed_special)
+            tokens.append(_toks)
+            max_len = max(max_len, len(_toks))
+        
+        tokens_tensor = torch.full((len(seqs), max_len), fill_value=self.pad_id, dtype=torch.long)
+        for i, toks in enumerate(tokens):
+            if padding_side=='right':
+                tokens_tensor[i, :len(toks)] = torch.tensor(toks, dtype=torch.long)
+            else:
+                tokens_tensor[i, -len(toks):] = torch.tensor(toks, dtype=torch.long)
+        
+        return tokens_tensor
+
     def decode(self, t: Sequence[int]) -> str:
         return self.model.decode(cast(List[int], t))
     
-
-class Formatter:
-    def __init__(self, tokenizer: Tokenizer):
-        self.tokenizer = tokenizer
-    
+    def decode_batch(self, texts: Sequence[Sequence[int]]) -> str:
+        return [self.decode(t) for t in texts]
+        
     def encode_header(self, message):
         tokens = []
-        tokens.append(self.tokenizer.special_tokens["<|start_header_id|>"])
-        tokens.extend(self.tokenizer.encode(message["role"], bos=False, eos=False))
-        tokens.append(self.tokenizer.special_tokens["<|end_header_id|>"])
-        tokens.extend(self.tokenizer.encode("\n\n", bos=False, eos=False))
+        tokens.append(self.special_tokens["<|start_header_id|>"])
+        tokens.extend(self.encode(message["role"], bos=False, eos=False))
+        tokens.append(self.special_tokens["<|end_header_id|>"])
+        tokens.extend(self.encode("\n\n", bos=False, eos=False))
         return tokens
 
     def encode_message(self, message: Message) -> List[int]:
         tokens = self.encode_header(message)
         tokens.extend(
-            self.tokenizer.encode(message["content"].strip(), bos=False, eos=False)
+            self.encode(message["content"].strip(), bos=False, eos=False)
         )
-        tokens.append(self.tokenizer.special_tokens["<|eot_id|>"])
+        tokens.append(self.special_tokens["<|eot_id|>"])
         return tokens
 
     def encode_dialog_prompt(self, dialog: Dialog) -> List[int]:
         tokens = []
-        tokens.append(self.tokenizer.special_tokens["<|begin_of_text|>"])
+        tokens.append(self.special_tokens["<|begin_of_text|>"])
         for message in dialog:
             tokens.extend(self.encode_message(message))
         tokens.extend(self.encode_header({"role": "assistant", "content": ""}))
