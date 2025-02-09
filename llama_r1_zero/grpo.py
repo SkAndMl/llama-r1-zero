@@ -43,9 +43,9 @@ class GRPOLoss:
         # completions -> bs, g
         # ground_truths -> bs
         bs = len(completions)
-        print(f'num of completions: {len(completions)}')
-        for completion in completions:
-            print(completion)
+        # for i, completion in enumerate(completions):
+        #     print(f'completion: {i+1}\n{completion}')
+        #     print('-'*50)
         rewards = torch.zeros((bs//self.num_generations, self.num_generations))
         for i in range(0, len(completions), self.num_generations):
             for reward_func in self.reward_funcs:
@@ -53,7 +53,7 @@ class GRPOLoss:
                     completions=completions[i:i+self.num_generations],
                     ground_truths=[ground_truths[i//self.num_generations]]*self.num_generations
                 )
-                rewards[i, :] += torch.tensor(_rewards).float()
+                rewards[i//self.num_generations, :] += torch.tensor(_rewards).float()
 
         return rewards.view(-1,) # bs*g
 
@@ -99,7 +99,14 @@ class GRPOLoss:
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        completions = self.tokenizer.decode_batch(completion_ids.tolist())
+        completions = []
+        for _c in completion_ids.tolist():
+            idx = len(_c)
+            if self.tokenizer.special_tokens['<|eot_id|>'] in _c:
+                idx = _c.index(self.tokenizer.special_tokens['<|eot_id|>'])
+            completions.append(_c[:idx])
+
+        completions = self.tokenizer.decode_batch(completions)
         
         rewards = self.compute_rewards(completions, ground_truths)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)

@@ -104,9 +104,15 @@ class Llama:
 
             start = max_prompt_len-len(prompt_tokens[i//num_generations]) if echo else max_prompt_len
             toks: List[int] = completion[start:]
-            if self.tokenizer.special_tokens['<|end_of_text|>'] in toks:
-                idx = toks.rindex(self.tokenizer.special_tokens['<|end_of_text>'])
-                toks = toks[:idx]
+            if self.tokenizer.special_tokens['<|eot_id|>'] in toks:
+                try:
+                    idx = toks.index(
+                        self.tokenizer.special_tokens['<|eot_id|>'],
+                        start=toks.index(self.tokenizer.special_tokens['<|eot_id>']+1)
+                    )
+                    toks = toks[:idx]
+                except:
+                    pass
             outs.append(toks)
         
         return outs
