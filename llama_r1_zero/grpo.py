@@ -57,7 +57,13 @@ class GRPOLoss:
 
         return rewards.view(-1,) # bs*g
 
-    def compute_loss(self, model: Llama, prompts: List[str], ground_truths: List[str]) -> Union[torch.Tensor, tuple]:
+    def compute_loss(
+            self,
+            model: Llama,
+            prompts: List[str],
+            ground_truths: List[str],
+            print_generations: bool = False
+    ) -> Union[torch.Tensor, tuple]:
         
         prompt_inputs = [
             [
@@ -107,7 +113,12 @@ class GRPOLoss:
             completions.append(_c[:idx])
 
         completions = self.tokenizer.decode_batch(completions)
-        
+        if print_generations:
+            for i, completion in enumerate(completions):
+                print("*"*50, f"Completion {i+1}", "*"*50)
+                print(completion)
+                print("*"*115)
+
         rewards = self.compute_rewards(completions, ground_truths)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
